@@ -498,9 +498,9 @@ def score_gauge(score: float) -> go.Figure:
             'bgcolor': '#1e3a52',
             'bordercolor': '#0d1f2d',
             'steps': [
-                {'range': [0, 50], 'color': '#E5534B22'},
-                {'range': [50, 75], 'color': '#F5A62322'},
-                {'range': [75, 100], 'color': '#00D4AA22'},
+                {'range': [0, 50], 'color': 'rgba(229,83,75,0.13)'},
+                {'range': [50, 75], 'color': 'rgba(245,166,35,0.13)'},
+                {'range': [75, 100], 'color': 'rgba(0,212,170,0.13)'},
             ],
             'threshold': {'line': {'color': color, 'width': 3}, 'thickness': 0.8, 'value': score},
         }
@@ -551,7 +551,7 @@ def bar_chart(indicators: list) -> go.Figure:
     fig.add_trace(go.Scatter(
         name='Meta', x=names, y=goals,
         mode='markers', marker=dict(symbol='line-ew', size=14,
-                                    color='#ffffff66', line=dict(width=2, color='#ffffff88')),
+                                    color='rgba(255,255,255,0.4)', line=dict(width=2, color='rgba(255,255,255,0.53)')),
     ))
     fig.update_layout(
         **DARK_LAYOUT, height=300,
