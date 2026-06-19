@@ -584,6 +584,16 @@ def pie_chart(indicators: list) -> go.Figure:
 # ─────────────────────────────────────────────────────────────────────────────
 # EXCEL EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
+def sanitize_sheet_name(name: str) -> str:
+    """Excel sheet names can't contain: \\ / * ? : [ ] and must be <=31 chars."""
+    invalid_chars = ['\\', '/', '*', '?', ':', '[', ']']
+    clean = name
+    for ch in invalid_chars:
+        clean = clean.replace(ch, '-')
+    clean = clean.strip()
+    return clean[:31] if clean else 'Sheet'
+
+
 def export_excel(result: dict) -> bytes:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
@@ -622,8 +632,9 @@ def export_excel(result: dict) -> bytes:
                              'total_float_hr_cnt', 'early_start_date', 'early_end_date',
                              'cstr_type', 'status_code']
                 cols_avail = [c for c in cols_want if c in aff.columns]
+                sheet_title = sanitize_sheet_name(f"#{ind['id']} {ind['short']}")
                 aff[cols_avail].to_excel(
-                    writer, sheet_name=f"#{ind['id']} {ind['short']}"[:31], index=False
+                    writer, sheet_name=sheet_title, index=False
                 )
     return buf.getvalue()
 
@@ -879,7 +890,7 @@ def main():
                 st.download_button(
                     label="⬇️ Baixar Relatório Excel (.xlsx)",
                     data=excel_bytes,
-                    file_name=f"DCMA_{result['project_name']}_{datetime.now():%Y%m%d}.xlsx",
+                    file_name=f"DCMA_{sanitize_sheet_name(result['project_name']).replace(' ', '_')}_{datetime.now():%Y%m%d}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             except Exception as e:
@@ -900,7 +911,7 @@ def main():
             st.download_button(
                 label="⬇️ Baixar Resumo CSV",
                 data=csv_str.encode('utf-8-sig'),
-                file_name=f"DCMA_{result['project_name']}_{datetime.now():%Y%m%d}.csv",
+                file_name=f"DCMA_{sanitize_sheet_name(result['project_name']).replace(' ', '_')}_{datetime.now():%Y%m%d}.csv",
                 mime="text/csv",
             )
 
