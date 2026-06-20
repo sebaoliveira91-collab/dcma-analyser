@@ -11,6 +11,12 @@ from io import BytesIO, StringIO
 import re
 from datetime import datetime
 
+from analytics_modules import (
+    run_pert_analysis, pert_probability_chart,
+    run_resource_analysis,
+    generate_s_curve, GROUPING_OPTIONS,
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,7 +760,9 @@ def main():
     st.markdown("---")
 
     # ── Tabs ──
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "📋 Indicadores", "🔍 Detalhes", "📝 Log & Export"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Dashboard", "📋 Indicadores", "🔍 Detalhes", "📝 Log & Export", "🧪 Análises Avançadas"
+    ])
 
     # ════════════════════════════════════════
     # TAB 1 — DASHBOARD
@@ -914,6 +922,135 @@ def main():
                 file_name=f"DCMA_{sanitize_sheet_name(result['project_name']).replace(' ', '_')}_{datetime.now():%Y%m%d}.csv",
                 mime="text/csv",
             )
+
+    # ════════════════════════════════════════
+    # TAB 5 — ANÁLISES AVANÇADAS (PERT · Recursos · Curva S)
+    # ════════════════════════════════════════
+    with tab5:
+        tasks_df = result['tasks_df']
+        rsrc_df = dfs.get('TASKRSRC', pd.DataFrame())
+
+        sub_pert, sub_rsrc, sub_scurve = st.tabs([
+            "🎲 Simulação PERT", "👷 Recursos", "📈 Curva S"
+        ])
+
+        # ── 5.1 — PERT ──
+        with sub_pert:
+            st.markdown("#### Simulação Probabilística PERT (Beta)")
+            st.caption(
+                "Como o cronograma original não traz os 3 tempos, eles são simulados a partir "
+                "da duração atual do P6: Otimista = -10%, Mais Provável = duração atual, "
+                "Pessimista = +20%. O caminho crítico (folga ≤ 0) é usado para o cálculo "
+                "estocástico do prazo do projeto."
+            )
+
+            pert = run_pert_analysis(tasks_df)
+
+            cA, cB, cC = st.columns(3)
+            with cA:
+                st.metric("Tempo Esperado (TE)", f"{pert['project_te_hours']/8:.1f} dias")
+            with cB:
+                st.metric("Desvio Padrão (DP)", f"{pert['project_sd_hours']/8:.1f} dias")
+            with cC:
+                st.metric("Atividades Críticas", pert['critical_count'])
+
+            st.markdown("---")
+            st.markdown("**Probabilidade de conclusão até uma Data Alvo**")
+
+            target_date = st.date_input(
+                "Selecione a Data Alvo de conclusão do projeto",
+                value=None,
+                help="A probabilidade é calculada via Z-score sobre a distribuição normal do TE do projeto.",
+            )
+
+            if target_date and pert['critical_count'] > 0:
+                # converte a data alvo em horas decorridas desde o início do caminho crítico
+                crit_tasks = pert['df'][pert['df']['is_critical']]
+                start_dates = pd.to_datetime(tasks_df.loc[crit_tasks.index, 'early_start_date'], errors='coerce') \
+                    if 'early_start_date' in tasks_df.columns else pd.Series(dtype='datetime64[ns]')
+
+                if not start_dates.dropna().empty:
+                    project_start = start_dates.min()
+                    target_hours = (pd.Timestamp(target_date) - project_start).total_seconds() / 3600.0
+                else:
+                    target_hours = pert['project_te_hours']  # fallback se não houver datas
+
+                prob = pert['prob_fn'](target_hours)
+                color = "🟢" if prob >= 70 else "🟡" if prob >= 40 else "🔴"
+                st.markdown(f"### {color} Probabilidade de sucesso: **{prob:.1f}%**")
+
+                fig = pert_probability_chart(pert, target_hours)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.plotly_chart(pert['dist_fig'], use_container_width=True)
+                if pert['critical_count'] == 0:
+                    st.warning("Nenhuma atividade crítica (folga ≤ 0) encontrada para simular o caminho crítico.")
+
+        # ── 5.2 — RECURSOS ──
+        with sub_rsrc:
+            st.markdown("#### Análise Crítica de Recursos")
+
+            if rsrc_df.empty:
+                st.info("Este arquivo XER não contém a tabela **TASKRSRC** (sem recursos atribuídos).")
+            else:
+                daily_limit = st.slider(
+                    "Limite diário de alocação por recurso (horas)",
+                    min_value=4.0, max_value=16.0, value=8.0, step=0.5,
+                )
+
+                res = run_resource_analysis(tasks_df, rsrc_df, daily_limit_hours=daily_limit)
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    n_over_rsrc = res['overallocated']['rsrc_id'].nunique() if not res['overallocated'].empty else 0
+                    st.metric("Recursos Superalocados", n_over_rsrc)
+                with c2:
+                    n_bottleneck = len(res['critical_bottlenecks']) if not res['critical_bottlenecks'].empty else 0
+                    st.metric("Recursos em Gargalo Crítico", n_bottleneck)
+
+                st.plotly_chart(res['histogram_fig'], use_container_width=True)
+
+                if not res['overallocated'].empty:
+                    with st.expander(f"⚠️ Dias com Superalocação ({len(res['overallocated'])} ocorrências)"):
+                        display_over = res['overallocated'].rename(columns={
+                            'rsrc_id': 'Recurso', 'date': 'Data',
+                            'allocated_hours': 'Horas Alocadas', 'is_overallocated': 'Superalocado',
+                        })
+                        st.dataframe(display_over.head(300), use_container_width=True, hide_index=True)
+
+                if not res['critical_bottlenecks'].empty:
+                    with st.expander(f"🚨 Gargalos do Caminho Crítico ({len(res['critical_bottlenecks'])} recursos)"):
+                        display_bn = res['critical_bottlenecks'].rename(columns={
+                            'rsrc_id': 'Recurso', 'atividades_criticas': 'Atividades Críticas',
+                            'horas_alocadas_total': 'Horas Alocadas (Total)',
+                        })
+                        st.dataframe(display_bn, use_container_width=True, hide_index=True)
+
+        # ── 5.3 — CURVA S ──
+        with sub_scurve:
+            st.markdown("#### Curva S de Progresso")
+
+            col_metric, col_freq = st.columns([2, 1])
+            with col_metric:
+                weight_options = {'Duração (horas)': 'target_drtn_hr_cnt'}
+                if 'target_cost' in tasks_df.columns:
+                    weight_options['Custo Orçado'] = 'target_cost'
+                weight_label = st.selectbox("Base de cálculo do avanço", list(weight_options.keys()))
+                weight_col = weight_options[weight_label]
+            with col_freq:
+                freq_label = st.selectbox("Agrupamento do eixo X", list(GROUPING_OPTIONS.keys()), index=1)
+                freq = GROUPING_OPTIONS[freq_label]
+
+            s_curve = generate_s_curve(tasks_df, weight_col=weight_col, freq=freq)
+            st.plotly_chart(s_curve['fig'], use_container_width=True)
+
+            if not s_curve['periodic_df'].empty:
+                with st.expander("📋 Dados da Curva S"):
+                    display_s = s_curve['periodic_df'].rename(columns={
+                        'period': 'Período', 'period_value': 'Esforço no Período',
+                        'cumulative_value': 'Acumulado', 'cumulative_pct': 'Acumulado (%)',
+                    })
+                    st.dataframe(display_s, use_container_width=True, hide_index=True)
 
 
 if __name__ == '__main__':
