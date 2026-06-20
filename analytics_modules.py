@@ -115,6 +115,13 @@ def run_pert_analysis(tasks_df: pd.DataFrame) -> dict:
     }
 
 
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """Converte '#RRGGBB' em 'rgba(r,g,b,a)' — Plotly recente rejeita hex de 8 dígitos (#RRGGBBAA)."""
+    h = hex_color.lstrip('#')
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f'rgba({r},{g},{b},{alpha})'
+
+
 def _pert_distribution_chart(mean_hours: float, sd_hours: float, target_hours: float | None = None) -> go.Figure:
     """Curva de Gauss da duração do projeto, com marcação opcional da Data Alvo."""
     if sd_hours <= 0:
@@ -137,7 +144,7 @@ def _pert_distribution_chart(mean_hours: float, sd_hours: float, target_hours: f
     ))
 
     # Linha do TE médio
-    fig.add_vline(x=mean_days, line_dash='dash', line_color='#ffffff88',
+    fig.add_vline(x=mean_days, line_dash='dash', line_color='rgba(255,255,255,0.53)',
                    annotation_text=f'TE = {mean_days:.1f}d', annotation_font_color='#c8d8e8')
 
     # Faixas de confiança ±1σ / ±2σ
@@ -161,7 +168,7 @@ def _pert_distribution_chart(mean_hours: float, sd_hours: float, target_hours: f
         if len(x_fill):
             fig.add_trace(go.Scatter(
                 x=x_fill, y=y_fill, mode='lines', fill='tozeroy',
-                fillcolor=f'{color}33', line=dict(width=0), showlegend=False, hoverinfo='skip',
+                fillcolor=_hex_to_rgba(color, 0.2), line=dict(width=0), showlegend=False, hoverinfo='skip',
             ))
 
     fig.update_layout(
@@ -297,24 +304,28 @@ def run_resource_analysis(
 def _explode_date_range_vectorized(merged: pd.DataFrame) -> pd.DataFrame:
     """
     Expande cada linha (recurso alocado num período) em uma linha por dia,
-    sem usar iterrows — usa np.repeat + concatenação de date_ranges.
+    de forma totalmente vetorizada: usa np.repeat para replicar as linhas-base
+    e soma um offset de dias (np.arange por grupo, via cumsum de um reset) —
+    sem laços Python sobre as datas, o que mantém custo ~O(total_dias) com
+    overhead mínimo mesmo em XERs com dezenas de milhares de atividades.
     """
-    starts = merged['early_start_date'].values
-    ends = merged['early_end_date'].values
-    n_days = merged['n_days'].values
+    n_days = merged['n_days'].values.astype(int)
+    starts = merged['early_start_date'].values.astype('datetime64[D]')
 
-    # gera todos os offsets de dia de uma vez e repete os índices de origem
-    all_dates = []
-    for start, n in zip(starts, n_days):
-        all_dates.append(pd.date_range(start=start, periods=int(n), freq='D'))
-    # concatenação única — ainda é um loop em python, mas só sobre arrays de datas
-    # (não há forma 100% vetorizada de variar o nº de períodos por linha em pandas puro;
-    # esta abordagement evita iterrows sobre o DataFrame completo e mantém custo O(total_dias))
-    dates_concat = np.concatenate([d.values for d in all_dates]) if all_dates else np.array([], dtype='datetime64[ns]')
-    repeat_counts = n_days.astype(int)
+    total_rows = int(n_days.sum())
+    if total_rows == 0:
+        return merged.iloc[0:0][['rsrc_id', 'date', 'hours_per_day', 'task_id']].assign(date=pd.NaT)
 
-    exploded = merged.loc[merged.index.repeat(repeat_counts)].reset_index(drop=True)
-    exploded['date'] = dates_concat
+    # índice de origem replicado (linha base -> N dias)
+    repeat_idx = np.repeat(np.arange(len(merged)), n_days)
+
+    # offset de dia dentro de cada grupo: 0,1,2,...,n-1 para cada linha, concatenado
+    # construído via subtração de um arange global pelo "início do grupo" repetido
+    group_starts = np.concatenate(([0], np.cumsum(n_days)[:-1])) if len(n_days) else np.array([])
+    day_offsets = np.arange(total_rows) - np.repeat(group_starts, n_days)
+
+    exploded = merged.iloc[repeat_idx].reset_index(drop=True)
+    exploded['date'] = starts[repeat_idx] + day_offsets.astype('timedelta64[D]')
     return exploded[['rsrc_id', 'date', 'hours_per_day', 'task_id']]
 
 
@@ -365,7 +376,7 @@ def _resource_histogram_chart(daily_summary: pd.DataFrame, daily_limit_hours: fl
 GROUPING_OPTIONS = {
     'Diário/Semanal': 'D',
     'Semanal/Mensal': 'W',
-    'Mensal/Anual': 'M',
+    'Mensal/Anual': 'ME',   # 'M' foi descontinuado no pandas 2.2+; 'ME' = Month End
 }
 
 
@@ -397,6 +408,8 @@ def generate_s_curve(
         'fig'          -> Figura Plotly (linha cumulativa + barras periódicas)
     """
     df = tasks_df.copy()
+    if freq == 'M':  # compat: aceita o alias antigo e converte para o atual
+        freq = 'ME'
     df['early_start_date'] = pd.to_datetime(df.get('early_start_date'), errors='coerce')
     df['early_end_date'] = pd.to_datetime(df.get('early_end_date'), errors='coerce')
     df[weight_col] = pd.to_numeric(df.get(weight_col, 0), errors='coerce').fillna(0.0)
@@ -414,16 +427,23 @@ def generate_s_curve(
     df['n_days'] = (df['early_end_date'] - df['early_start_date']).dt.days.clip(lower=0) + 1
     df['value_per_day'] = df[weight_col] / df['n_days']
 
-    # ── expansão vetorizada diária (mesma técnica do Módulo 2) ──
-    starts = df['early_start_date'].values
+    # ── expansão vetorizada diária (np.repeat + offset de dias, sem laço por linha) ──
     n_days = df['n_days'].values.astype(int)
-    date_ranges = [pd.date_range(start=s, periods=n, freq='D') for s, n in zip(starts, n_days)]
-    dates_concat = (
-        np.concatenate([d.values for d in date_ranges])
-        if date_ranges else np.array([], dtype='datetime64[ns]')
-    )
-    exploded = df.loc[df.index.repeat(n_days)].reset_index(drop=True)
-    exploded['date'] = dates_concat
+    starts = df['early_start_date'].values.astype('datetime64[D]')
+    total_rows = int(n_days.sum())
+
+    if total_rows == 0:
+        return {
+            'periodic_df': pd.DataFrame(),
+            'fig': _empty_fig('Sem atividades com datas/peso válidos para a Curva S'),
+        }
+
+    repeat_idx = np.repeat(np.arange(len(df)), n_days)
+    group_starts = np.concatenate(([0], np.cumsum(n_days)[:-1]))
+    day_offsets = np.arange(total_rows) - np.repeat(group_starts, n_days)
+
+    exploded = df.iloc[repeat_idx].reset_index(drop=True)
+    exploded['date'] = starts[repeat_idx] + day_offsets.astype('timedelta64[D]')
 
     # ── agrega no período escolhido (D / W / M) ──
     exploded = exploded.set_index('date')
@@ -441,7 +461,7 @@ def generate_s_curve(
 
 
 def _s_curve_chart(periodic: pd.DataFrame, freq: str, weight_col: str) -> go.Figure:
-    freq_label = {'D': 'Diário', 'W': 'Semanal', 'M': 'Mensal'}.get(freq, freq)
+    freq_label = {'D': 'Diário', 'W': 'Semanal', 'M': 'Mensal', 'ME': 'Mensal'}.get(freq, freq)
 
     fig = go.Figure()
 
